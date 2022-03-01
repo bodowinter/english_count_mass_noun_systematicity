@@ -1,0 +1,1568 @@
+---
+title: "Analysis of count/mass systematicity: morphemes and length"
+author: "Bodo"
+date: "25/02/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+Load libraries:
+
+```{r packages, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(brms)
+library(effsize)
+library(patchwork)
+```
+
+Print versions for reproducibility (only those that will be reported in the write-up):
+
+```{r package_versions}
+R.Version()
+packageVersion('tidyverse')
+packageVersion('brms')
+packageVersion('effsize')
+packageVersion('patchwork')
+```
+
+Load data:
+
+```{r data_loading, message = FALSE, warning = FALSE}
+BECL <- read_csv('../data/BECL.csv')
+ELP <- read_csv('../data/ELP_red.csv')
+SUBTL <- read.csv('../data/SUBTLEX_US.csv',
+                  stringsAsFactors = FALSE) %>% as_tibble()
+CMU_full <- readLines('../data/CMU_dict-0.7b.txt') # for final phonemes
+CMU <- read_csv('../data/CMU_phoneme_counts.csv') # prepared phoneme counts
+OED <- read_csv('../data/OED_processed_etymologies.csv')
+```
+
+## Data carpentry and overview
+
+How many count / mass nouns do we have?
+
+```{r check_rows}
+nrow(BECL)
+```
+
+Around 12,000 nouns.
+
+Check how many there are per category:
+
+```{r count_senses}
+BECL %>% count(major_class, sort = TRUE)
+```
+
+Make a plot of this:
+
+```{r plot_senses}
+# Plot basics:
+
+type_p <- BECL %>%
+  count(major_class, sort = TRUE) %>% 
+  mutate(major_class = str_replace_all(major_class, '_', ' '),
+         major_class = ifelse(major_class == 'both mass count',
+                              'both mass/count', major_class),
+         major_class = ifelse(major_class == 'neither mass count',
+                              'neither mass/count', major_class)) %>%
+  ggplot(aes(x = reorder(major_class, n),
+             y = n,
+             fill = major_class)) +
+  geom_col(col = 'black')
+
+# Scales and axes:
+
+type_p <- type_p +
+  scale_fill_brewer(palette = 'Set1') +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 10000),
+                     breaks = seq(0, 10000, 2000)) +
+  ylab('Frequency') +
+  xlab(NULL)
+
+# Cosmetics:
+
+type_p <- type_p +
+  theme_classic() +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(angle = 45,
+                                   hjust = 1,
+                                   vjust = 1, size = 12),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 16))
+
+# Show and save:
+
+type_p
+ggsave(plot = type_p, '../figures/BECL_counts.pdf',
+       width = 4, height = 4)
+```
+
+The majority are either count or mass. There are very few 'elastics' or 'neither'. It's hard to formulate predictions for these, so we will exclude them. Along the way, we count how many we exclude.
+
+```{r exclude_elastics}
+# Exclude:
+
+BECL <- filter(BECL,
+               major_class %in% c('regular_count',
+                                  'regular_mass'))
+```
+
+Lemmatize this. What we'll do is get the counts of "regular_mass" and "regular_count" per words and get two subsets. In one, we will go by a simple majority rule, e.g., if "regular_mass" > "regular_count" across senses, then a word will be "regular_mass". In another dataset, we'll take only those that are never the other.
+
+```{r lemmatize_BECL}
+BECL_wide <- BECL %>%
+  count(lemma, major_class) %>% 
+  pivot_wider(values_from = n,
+              names_from = major_class, values_fill = 0)
+
+# Which more?
+
+BECL_wide <- mutate(BECL_wide,
+                    cnt_mass = ifelse(regular_count > regular_mass, 'count', NA),
+                    cnt_mass = ifelse(regular_count < regular_mass, 'mass', cnt_mass))
+```
+
+Check:
+
+```{r check_BECL_counts}
+# Mass:
+
+filter(BECL_wide, cnt_mass == 'mass')
+
+# Count:
+
+filter(BECL_wide, cnt_mass == 'count')
+
+# Equals:
+
+filter(BECL_wide, is.na(cnt_mass))
+```
+
+Get rid of the equals:
+
+```{r exclude_equals}
+BECL_wide <- filter(BECL_wide, !is.na(cnt_mass))
+```
+
+Create a new column that adds labels 'mass sometimes count' and 'count sometimes mass':
+
+```{r code_dominance}
+BECL_wide <- mutate(BECL_wide,
+                    cnt_detailed = ifelse(cnt_mass == 'mass' & regular_count > 0,
+                                          'mass sometimes count', cnt_mass),
+                    cnt_detailed = ifelse(cnt_mass == 'count' & regular_mass > 0,
+                                          'count sometimes mass', cnt_detailed))
+```
+
+Check:
+
+```{r check_dominance}
+# Count, sometimes mass:
+
+filter(BECL_wide, cnt_detailed == 'count sometimes mass')
+
+# Mass, sometimes count:
+
+filter(BECL_wide, cnt_detailed == 'mass sometimes count')
+```
+
+Add ELP morphology and length data:
+
+```{r join_ELP_data}
+ELP <- mutate(ELP, Word = str_to_lower(Word))
+BECL_wide <- left_join(BECL_wide, # first df
+                       select(ELP, # second df
+                              Word, NSyll, NPhon, NMorph),
+                       by = c('lemma' = 'Word'))
+```
+
+Add SUBTLEX frequencies:
+
+```{r join_frequency}
+BECL_wide <- left_join(BECL_wide, select(SUBTL, Word, FREQcount),
+                       by = c('lemma' = 'Word'))
+```
+
+NAs are true zeros here. And log-transform these:
+
+```{r log_frequencies}
+BECL_wide <- BECL_wide %>% 
+  rename(freq = FREQcount) %>% 
+  mutate(freq = ifelse(is.na(freq), 0, freq),
+         logfreq = log10(freq + 1),
+         
+         # Center the logfreq variable:
+         
+         logfreq_c = logfreq - mean(logfreq))
+```
+
+Add CMU data:
+
+```{r join_CMU}
+BECL_wide <- left_join(BECL_wide, CMU, by = c('lemma' = 'Word'))
+```
+
+Add OED data:
+
+```{r join_OED}
+BECL_wide <- left_join(BECL_wide, OED,
+                       by = c('lemma' = 'word'))
+```
+
+This distribution would have no zeros... since every word has at least one morpheme by definition, well subtract -1 to count "extra morphemes":
+
+```{r subtract_one_nmorph}
+BECL_wide <- mutate(BECL_wide,
+                    NMorph_0 = NMorph - 1,
+                    NPhon_0 = NPhon - 1,
+                    NSyll_0 = NSyll - 1)
+```
+
+Clean the `major_etym` field which will be used repeatedly below for plotting, so we want the labels to look nice:
+
+```{r clean_major_etym}
+BECL_wide <- mutate(BECL_wide,
+                    major_etym = str_to_title(major_etym),
+                    major_etym = ifelse(major_etym == 'Other',
+                                        'other', major_etym))
+```
+
+## Extract subsets
+
+Exclude those without CMU data:
+
+```{r filter_no_CMU}
+BECL_wide <- filter(BECL_wide, !is.na(AA))
+```
+
+Exclude those without etymological data:
+
+```{r exclude_no_etyms}
+BECL_wide <- filter(BECL_wide, !is.na(major_etym))
+```
+
+A subset of those that are _only_ completely mass or completely count:
+
+```{r pure_BECL}
+BECL_clean <- filter(BECL_wide,
+                     cnt_detailed != 'mass sometimes count',
+                     cnt_detailed != 'count sometimes mass')
+```
+
+Need to get rid of duplicates:
+
+```{r}
+BECL_clean <- filter(BECL_clean,
+                     !duplicated(lemma))
+```
+
+Check how much each:
+
+```{r count_masscount}
+BECL_clean %>% count(cnt_detailed) %>% 
+  mutate(prop = n / sum(n),
+         prop = round(prop, 2))
+```
+
+Create a subset with only the monomorphemics to be used later:
+
+```{r monomorphemic_subset_extraction}
+mono <- filter(BECL_clean, NMorph == 1)
+```
+
+How many of these were of each type for the reduced dataset of monomorphemics?
+
+```{r count_masscount_monomorphemics}
+mono %>%
+  count(cnt_mass) %>% 
+  mutate(prop = n / sum(n),
+         prop = round(prop, 1))
+```
+
+## Etymological analysis
+
+For plotting, get the counts of mass and count nouns:
+
+```{r masscount_N_table}
+cnt_mass_counts <- BECL_clean %>%
+  count(cnt_mass) %>% 
+  mutate(N = str_c('N = ', n))
+```
+
+How many of each are French or Latin? Make a plot of this:
+
+```{r etymology_p}
+# Plot basics:
+
+etym_p <- BECL_clean %>% 
+  count(cnt_mass, major_etym) %>% 
+  group_by(cnt_mass) %>% 
+  mutate(prop = n / sum(n)) %>% 
+  left_join(cnt_mass_counts,
+            by = c('cnt_mass' = 'cnt_mass')) %>% 
+  mutate(cnt_mass = str_c(cnt_mass, '\n', N)) %>% 
+
+# The actual plot:  
+    
+  ggplot(aes(x = cnt_mass, y = prop, fill = major_etym)) +
+  geom_col()
+
+# Scales and axes:
+
+etym_p <- etym_p +
+  scale_fill_brewer(palette = 'Set1') +
+  xlab(NULL) +
+  ylab('Proportion') +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 1),
+                     breaks = seq(0, 1, 0.25))
+
+# Cosmetics:
+
+etym_p <- etym_p +
+  theme_classic() +
+  theme(legend.position = 'top',
+        legend.title = element_blank(),
+        axis.text.x = element_text(size = 12),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 16),
+        plot.margin = margin(r = 70, l = 20, b = 10))
+
+# Show and save:
+
+etym_p
+ggsave('../figures/etymology.pdf', etym_p,
+       width = 3, height = 4)
+```
+
+Set weakly informative / regularizing priors on beta coefficients. These will be used throughout all models below. This is a bit lazy, but they are all either bernoulli or negative binomial models, and SD = 1 is decently conservative for both types of models.
+
+```{r set_priors}
+priors <- c(prior(normal(0, 1), class = b))
+```
+
+Make an analysis with all etymologies as a four-level predictor:
+
+```{r etym_mdl}
+etym_mdl <- brm(cnt_mass ~ 1 + major_etym,
+                data = BECL_clean,
+                  
+                # Likelihood function:
+                family = bernoulli,
+                  
+                # Priors:
+                prior = priors,
+                
+                # MCMC settings:
+                init = 0, seed = 666,
+                cores = 4, chains = 4,
+                warmup = 2000, iter = 4000)
+
+# Save the model:
+
+save(etym_mdl,
+     file = '../models/etym_mdl.Rdata')
+```
+
+Check the model:
+
+```{r etym_mdl_check}
+etym_mdl
+
+# Check R-squared:
+
+bayes_R2(etym_mdl)
+```
+
+Create the corresponding null model:
+
+```{r etym_null_mdl}
+etym_null_mdl <- brm(cnt_mass ~ 1,
+                     data = BECL_clean,
+                  
+                     # Likelihood function:
+                     family = bernoulli,
+                
+                     # MCMC settings:
+                     init = 0, seed = 666,
+                     cores = 4, chains = 4,
+                     warmup = 2000, iter = 4000)
+
+# Save the model:
+
+save(etym_null_mdl,
+     file = '../models/etym_null_mdl.Rdata')
+```
+
+Perform leave-one-out cross-validation:
+
+```{r}
+# LOO-CV for each model:
+
+etym_loo <- loo(etym_mdl)
+etym_null_loo <- loo(etym_null_mdl)
+
+# Comparison:
+
+etym_loo_compare <- loo_compare(etym_null_loo, etym_loo)
+```
+
+Check:
+
+```{r etym_loo_compare_check}
+etym_loo_compare
+```
+
+Big difference between the models compared to LOO-CV standard error, so quite a reliable result.
+
+## Morpheme analysis
+
+How does etymology relate to morpheme count?
+
+```{r etym_morpheme_avgs}
+BECL_clean %>% 
+  group_by(major_etym) %>% 
+  summarize(M = mean(NMorph, na.rm = TRUE),
+            SD = sd(NMorph, na.rm = TRUE))
+```
+
+Different way of looking at this data is to take the count of French, Latin etc. per number of morphemes category:
+
+```{r etym_nmorph_count}
+nmorph_counts <- BECL_clean %>% 
+  filter(!is.na(NMorph)) %>% 
+  count(NMorph, major_etym) %>% 
+  group_by(NMorph) %>% 
+  mutate(prop = n/ sum(n))
+
+# Show table:
+
+nmorph_counts
+```
+
+Append the N next to that:
+
+```{r append_nmorph_etym_count}
+N_nmorph <- BECL_clean %>% 
+  count(NMorph) %>%
+  filter(!is.na(NMorph)) %>% 
+  rename(N = n)
+
+# Merge:
+
+nmorph_counts <- left_join(nmorph_counts, N_nmorph)
+
+# Create the labels for the x-axis:
+
+nmorph_counts <- mutate(nmorph_counts,
+                        NMorph = str_c(NMorph, ' morphemes\nN = ',
+                                       N))
+
+# Change only the first two, since it needs singular:
+
+nmorph_counts[1:4, ]$NMorph <- '1 morpheme\nN = 5142'
+
+# Check:
+
+nmorph_counts
+```
+
+Make a stacked bar plot of this:
+
+```{r etym_nmorph_p}
+# Plot basics:
+
+nmorph_etym_p <- nmorph_counts %>% 
+  ggplot(aes(x = factor(NMorph), y = prop, fill = major_etym)) +
+  geom_col()
+
+# Axes and labels:
+
+nmorph_etym_p <- nmorph_etym_p +
+  ylab('Proportion') +
+  xlab(NULL) +
+  scale_fill_brewer(palette = 'Set1') +
+  scale_y_continuous(expand = c(0, 0))
+
+# Cosmetics:
+
+nmorph_etym_p <- nmorph_etym_p +
+  theme_classic() +
+  theme(legend.position = 'top',
+        legend.title = element_blank(),
+        axis.text.x = element_text(size = 10,
+                                   angle = 45,
+                                   vjust = 1,
+                                   hjust = 1),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 16,
+                                    margin = margin(r = 5)),
+        axis.title.x = element_text(face = 'bold',
+                                    size = 16))
+
+# Show and save:
+
+nmorph_etym_p
+ggsave('../figures/morpheme_count_etymology.pdf',
+       width = 4, height = 4)
+```
+
+For the analysis below, make `Germanic` the reference level (most intuitive to start with that and compare Latin, other and French to that):
+
+```{r make_germanic_ref_level}
+BECL_clean <- mutate(BECL_clean,
+                     major_etym = factor(major_etym,
+                                         levels = c('Germanic',
+                                                    'French',
+                                                    'Latin',
+                                                    'other')))
+```
+
+Make a negative binomial model of the number of morphemes as a function of etymology. For this, we'll use the `NMorph_0` variable defined above which looks only at how many morphemes there are more than one morpheme, essentially setting monomorphemic words to zero (as a word cannot have less than one morpheme):
+
+```{r etym_morph_mdl}
+etym_morph_mdl <- brm(NMorph_0 ~ 1 + major_etym,
+                      data = BECL_clean,
+                  
+                      # Likelihood function:
+                      family = negbinomial,
+                  
+                      # Priors:
+                      prior = priors,
+                
+                      # MCMC settings:
+                      init = 0, seed = 666,
+                      cores = 4, chains = 4,
+                      warmup = 2000, iter = 4000)
+
+# Save:
+
+save(etym_morph_mdl,
+     file = '../models/nmorph_by_etym_mdl.Rdata')
+```
+
+Create the corresponding null model for an omnibus test with LOOCV:
+
+```{r etym_morph_mdl_null}
+etym_morph_mdl_null <- brm(NMorph_0 ~ 1,
+                           data = BECL_clean,
+                  
+                           # Likelihood function:
+                           family = negbinomial,
+                
+                           # MCMC settings:
+                           init = 0, seed = 666,
+                           cores = 4, chains = 4,
+                           warmup = 2000, iter = 4000)
+
+# Save:
+
+save(etym_morph_mdl_null,
+     file = '../models/nmorph_by_etym_null_mdl.Rdata')
+```
+
+Perform LOOCV as omnibus test:
+
+```{r etym_morph_LOO}
+etym_morph_LOO <- loo(etym_morph_mdl)
+etym_morph_LOO_null <- loo(etym_morph_mdl_null)
+
+# Compare:
+
+etym_morph_loo_compare <- loo_compare(etym_morph_LOO,
+                                      etym_morph_LOO_null)
+
+# Show:
+
+etym_morph_loo_compare
+```
+
+So, incorporating etymology does lead to an increase in LOO predictive performance, which suggests that we should control for it.
+
+Check the main model (not the comparison null model):
+
+```{r show_etym_morph_mdl}
+etym_morph_mdl
+
+bayes_R2(etym_morph_mdl)
+```
+
+Make a plot of the morpheme count by mass/count. For this, we'll calculate the proportion of count/mass for each number of morphemes:
+
+```{r compute_nmorph_counts}
+nmorph_counts <- BECL_clean %>% 
+  filter(!is.na(NMorph)) %>% 
+  count(NMorph, cnt_mass) %>% 
+  group_by(NMorph) %>% 
+  mutate(prop = n/ sum(n))
+
+# Show table:
+
+nmorph_counts
+```
+
+Append the N next to that:
+
+```{r add_N_to_nmorph_counts}
+N_nmorph <- BECL_wide %>% 
+  count(NMorph) %>%
+  filter(!is.na(NMorph)) %>% 
+  rename(N = n)
+
+# Merge:
+
+nmorph_counts <- left_join(nmorph_counts, N_nmorph)
+
+# Create the labels for the x-axis:
+
+nmorph_counts <- mutate(nmorph_counts,
+                        NMorph = str_c(NMorph, ' morphemes\nN = ',
+                                       N))
+
+# Change only the first two, since it needs singular:
+
+nmorph_counts[1:2, ]$NMorph <- '1 morpheme\nN = 5142'
+
+# Check:
+
+nmorph_counts
+```
+
+Make the plot:
+
+```{r nmorph_p}
+# Plot basics:
+
+nmorph_p <- nmorph_counts %>% 
+  ggplot(aes(x = factor(NMorph),
+             y = prop, fill = cnt_mass)) +
+  geom_col()
+
+# Axes and labels:
+
+nmorph_p <- nmorph_p +
+  ylab('Proportion') +
+  xlab(NULL) +
+  scale_fill_brewer(palette = 'Set1') +
+  scale_y_continuous(expand = c(0, 0))
+
+# Cosmetics:
+
+nmorph_p <- nmorph_p +
+  theme_classic() +
+  theme(legend.position = 'top',
+        legend.title = element_blank(),
+        axis.text.x = element_text(size = 10,
+                                   angle = 45,
+                                   vjust = 1,
+                                   hjust = 1),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 16,
+                                    margin = margin(r = 5)),
+        axis.title.x = element_text(face = 'bold',
+                                    size = 16))
+
+# Show and save:
+
+nmorph_p
+ggsave('../figures/morpheme_count_mass.pdf',
+       width = 4, height = 4)
+```
+
+Make a model of this, morpheme count as a function of count/mass, controlling for etymology:
+
+```{r nmorph_mdl}
+nmorph_mdl <- brm(NMorph_0 ~ 1 + cnt_mass + major_etym,
+                  data = BECL_clean,
+                  
+                  # Likelihood function:
+                  family = negbinomial,
+                  
+                  # Priors:
+                  prior = priors,
+                
+                  # MCMC settings:
+                  init = 0, seed = 666,
+                  cores = 4, chains = 4,
+                  warmup = 2000, iter = 4000)
+
+# Save:
+
+save(nmorph_mdl,
+     file = '../models/nmorph_mdl.RData')
+```
+
+Check the model:
+
+```{r check_nmorph_mdl}
+nmorph_mdl
+
+bayes_R2(nmorph_mdl)
+```
+
+Perform a hypothesis test:
+
+```{r nmorph_hypothesis}
+hypothesis(nmorph_mdl, 'cnt_massmass > 0')
+```
+
+Plot the posterior distribution:
+
+```{r nmorph_post_p}
+# Plot basics:
+
+nmorph_post_p <- posterior_samples(nmorph_mdl) %>%
+  ggplot(aes(x = b_cnt_massmass)) +
+  geom_vline(xintercept = 0, linetype = 'dashed') +
+  geom_density(fill = 'steelblue',
+               alpha = 0.8)
+
+# Scales and axes:
+
+nmorph_post_p <- nmorph_post_p +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Probability density') +
+  xlab('Log coefficient')
+
+# Cosmetics:
+
+nmorph_post_p <- nmorph_post_p +
+  theme_classic() +
+  theme(axis.text.x = element_text(size = 12),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 16,
+                                    margin = margin(r = 5)),
+        axis.title.x = element_text(face = 'bold',
+                                    size = 16))
+
+# Show and save:
+
+nmorph_post_p
+ggsave('../figures/nmorph_posterior.pdf', nmorph_post_p,
+       width = 5, height = 3)
+```
+
+Combine stacked bar plot with posterior into a double plot:
+
+```{r nmorph_double_p}
+# Fix title re-adjusting in double plot:
+
+nmorph_post_p <- nmorph_post_p +
+  theme(axis.title.x = element_text(margin = margin(t = -60)))
+
+# Use patchwork for double plotting:
+
+nmorph_double_p <- nmorph_p + plot_spacer() + nmorph_post_p +
+  plot_layout(widths = c(2, 0.5, 4))
+
+# Show and save:
+
+nmorph_double_p
+ggsave('../figures/nmorph_double_plot.pdf',
+       width = 9, height = 4)
+```
+
+Make a plot of the conditional effects for this:
+
+```{r nmorph_conditional_effects_extract}
+# Extract conditional effects:
+
+nmorph_cond <- conditional_effects(nmorph_mdl,
+                                   effects = 'cnt_mass')
+
+# Extract data frame with conditional effects and 95% credible intervals:
+
+nmorph_pred_df <- nmorph_cond$cnt_mass
+```
+
+Make a ggplot out of this:
+
+```{r}
+# Plot basics:
+
+nmorph_cond_p <- nmorph_pred_df %>% 
+  ggplot(aes(x = cnt_mass, y = estimate__)) +
+  geom_point(size = 3, pch = 15) +
+  geom_errorbar(aes(ymin = lower__, ymax = upper__),
+                width = 0.4)
+
+# Axes and labels:
+
+nmorph_cond_p <- nmorph_cond_p +
+  scale_y_continuous(limits = c(0, 1.2), breaks = seq(0, 1.2, 0.2),
+                     expand = c(0, 0)) +
+  ylab('Posterior morpheme count') +
+  xlab(NULL)
+
+# Cosmetics:
+
+nmorph_cond_p <- nmorph_cond_p +
+  theme_classic() +
+  theme(axis.text.x = element_text(size = 12),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 12))
+
+# Show and save:
+
+nmorph_cond_p
+ggsave('../figures/nmorph_conditional_effects.pdf',
+       width = 2, height = 3.5)
+```
+
+
+## Frequency analysis
+
+From now on, we'll switch to the monomorphemics so that we can look at "pure" length, unfettered by whether words are multimorphemic or not.
+
+Average frequency:
+
+```{r freq_avgs}
+mono %>% group_by(cnt_mass) %>% 
+  summarize(freq_raw_M = mean(freq, na.rm = TRUE),
+            freq_raw_SD = sd(freq, na.rm = TRUE))
+```
+
+Make a boxplot of this:
+
+```{r freq_p}
+# Plot basics:
+
+freq_p <- mono %>%
+  ggplot(aes(x = cnt_mass, y = logfreq, fill = cnt_mass)) +
+  geom_boxplot()
+
+# Axes and scales:
+
+freq_p <- freq_p +
+  scale_fill_brewer(palette = 'Set1') +
+  ylab('Log10 frequency') +
+  xlab(NULL)
+
+# Cosmetics:
+
+freq_p <- freq_p +
+  theme_classic() +
+  theme(legend.position = 'none',
+        axis.text.x = element_text(size = 12),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 16,
+                                    margin = margin(r = 5)),
+        axis.title.x = element_text(face = 'bold',
+                                    size = 16))
+
+# Show and save:
+
+freq_p
+ggsave('../figures/frequency_boxplot.pdf', freq_p,
+       width = 3, height = 5)
+```
+
+Make a model of frequency:
+
+```{r freq_mdl}
+freq_mdl <- brm(freq ~ 1 + cnt_mass,
+                data = mono,
+                
+                # Likelihood function:
+                family = negbinomial,
+                  
+                # Priors:
+                prior = priors,
+                
+                # MCMC settings:
+                init = 0, seed = 666,
+                cores = 4, chains = 4,
+                warmup = 2000, iter = 4000)
+
+# Save:
+
+save(freq_mdl,
+     file = '../models/frequency_mdl.RData')
+```
+
+Show the model:
+
+```{r check_freq_mdl}
+freq_mdl
+
+bayes_R2(freq_mdl)
+```
+
+Perform hypothesis test of frequency:
+
+```{r freq_hypothesis}
+hypothesis(freq_mdl, 'cnt_massmass < 0')
+```
+
+## Length analyses: syllables
+
+Does word length depend on etymology? Syllables:
+
+```{r nsyll_etym_avgs}
+mono %>% 
+  group_by(major_etym) %>% 
+  summarize(NSyll_M = mean(NSyll, na.rm = TRUE),
+            NSyll_SD = sd(NSyll, na.rm = TRUE)) %>% 
+  arrange(NSyll_M)
+```
+
+Make a model of syllable length as a function of etymology, controlling for frequency:
+
+```{r nsyll_etym_mdl}
+nsyll_etym_mdl <- brm(NSyll_0 ~ 1 + major_etym + logfreq,
+                      data = mono,
+                  
+                      # Likelihood function:
+                      family = negbinomial,
+                  
+                      # Priors:
+                      prior = priors,
+                
+                      # MCMC settings:
+                      init = 0, seed = 666,
+                      cores = 4, chains = 4,
+                      warmup = 2000, iter = 4000)
+
+# Save:
+
+save(nsyll_etym_mdl,
+     file = '../models/nsyllable_by_etymology_mdl.RData')
+```
+
+Show the model:
+
+```{r check_nsyll_etym_mdl}
+nsyll_etym_mdl
+
+bayes_R2(nsyll_etym_mdl)
+```
+
+Get the comparison null model for LOO comparisons:
+
+```{r nsyll_etym_mdl_null}
+nsyll_etym_mdl_null <- brm(NSyll_0 ~ 1 + logfreq,
+                           data = mono,
+                  
+                           # Likelihood function:
+                           family = negbinomial,
+                  
+                           # Priors:
+                           prior = priors,
+                
+                           # MCMC settings:
+                           init = 0, seed = 666,
+                           cores = 4, chains = 4,
+                           warmup = 2000, iter = 4000)
+
+# Save:
+
+save(nsyll_etym_mdl_null,
+     file = '../models/nsyllable_by_etymology_mdl_null.RData')
+```
+
+Do LOO-CV for both:
+
+```{r nsyll_etym_loo}
+nsyll_etym_loo <- loo(nsyll_etym_mdl)
+nsyll_etym_null_loo <- loo(nsyll_etym_mdl_null)
+
+# LOO compare:
+
+nsyll_etym_loo_compare <- loo_compare(nsyll_etym_loo,
+                                      nsyll_etym_null_loo)
+
+# Show:
+
+nsyll_etym_loo_compare
+```
+
+This motivates the inclusion of etymology into the main model.
+
+Look at syllable number by count/mass. First, averages:
+
+```{r nsyll_avgs}
+mono %>% 
+  group_by(cnt_mass) %>% 
+  summarize(NSyll_M = mean(NSyll, na.rm = TRUE),
+            NSyll_SD = sd(NSyll, na.rm = TRUE))
+```
+
+Make a plot of the syllable count by mass/count. For this, we'll calculate the proportion of count/mass for each number of syllables:
+
+```{r nsyll_counts}
+nsyll_counts <- mono %>% 
+  filter(!is.na(NSyll)) %>% 
+  count(NSyll, cnt_mass) %>% 
+  group_by(NSyll) %>% 
+  mutate(prop = n/ sum(n))
+
+# Show table:
+
+nsyll_counts
+```
+
+Append the N next to that:
+
+```{r N_for_nsyll_counts}
+N_nsyll <- mono %>% 
+  count(NSyll) %>%
+  filter(!is.na(NSyll)) %>% 
+  rename(N = n)
+
+# Merge:
+
+nsyll_counts <- left_join(nsyll_counts, N_nsyll)
+
+# Create the labels for the x-axis:
+
+nsyll_counts <- mutate(nsyll_counts,
+                       NSyll = str_c(NSyll, ' syllables\nN = ',
+                                     N))
+
+# Change only the first two, since it needs singular:
+
+nsyll_counts[1:2, ]$NSyll <- '1 syllable\nN = 5142'
+
+# Check:
+
+nsyll_counts
+```
+
+Make the plot:
+
+```{r nsyll_p}
+# Plot basics:
+
+nsyll_p <- nsyll_counts %>% 
+  ggplot(aes(x = factor(NSyll),
+             y = prop, fill = cnt_mass)) +
+  geom_col()
+
+# Axes and labels:
+
+nsyll_p <- nsyll_p +
+  ylab('Proportion') +
+  xlab(NULL) +
+  scale_fill_brewer(palette = 'Set1') +
+  scale_y_continuous(expand = c(0, 0))
+
+# Cosmetics:
+
+nsyll_p <- nsyll_p +
+  theme_classic() +
+  theme(legend.position = 'top',
+        legend.title = element_blank(),
+        axis.text.x = element_text(size = 10,
+                                   angle = 45,
+                                   vjust = 1,
+                                   hjust = 1),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 16,
+                                    margin = margin(r = 5)),
+        axis.title.x = element_text(face = 'bold',
+                                    size = 16))
+
+# Show and save:
+
+nsyll_p
+ggsave('../figures/nsyll_count_mass.pdf',
+       width = 4, height = 4)
+```
+
+Make the big model with count/mass:
+
+Make a model of syllable length as a function of etymology, controlling for frequency:
+
+```{r nsyll_mdl}
+nsyll_mdl <- brm(NSyll_0 ~ 1 + cnt_mass +
+                   major_etym + logfreq,
+                 data = mono,
+                 
+                 # Likelihood function:
+                 family = negbinomial,
+                 
+                 # Priors:
+                 prior = priors,
+                
+                 # MCMC settings:
+                 init = 0, seed = 666,
+                 cores = 4, chains = 4,
+                 warmup = 2000, iter = 4000)
+
+# Save:
+
+save(nsyll_mdl,
+     file = '../models/nsyllable_mdl.RData')
+```
+
+Show the model:
+
+```{r check_nsyll_mdl}
+nsyll_mdl
+
+bayes_R2(nsyll_mdl)
+```
+
+Perform a hypothesis test for the influence of count/mass:
+
+```{r nsyll_hypothesis}
+hypothesis(nsyll_mdl, 'cnt_massmass > 0')
+```
+
+For a Bayes R2 of only the `cnt_mass` effect, we want to construct a model that has everything but that, so that we can factor out its unique contribution with respect to the control variables `major_etym` and `logfreq`:
+
+```{r nsyll_null_mdl}
+nsyll_null_mdl <- brm(NSyll_0 ~ 1 + 
+                        major_etym + logfreq,
+                      data = mono,
+                 
+                      # Likelihood function:
+                      family = negbinomial,
+                 
+                      # Priors:
+                      prior = priors,
+                
+                      # MCMC settings:
+                      init = 0, seed = 666,
+                      cores = 4, chains = 4,
+                      warmup = 2000, iter = 4000)
+
+# Save:
+
+save(nsyll_null_mdl,
+     file = '../models/nsyllable_null_mdl.RData')
+```
+
+Check Bayes R2 and get unique effect by comparing the difference between the two models that only differ in `cnt_mass`:
+
+```{r bayes_r2_nsyll_diff}
+bayes_R2(nsyll_null_mdl)
+
+# Difference between R2 to get unique contribution of count vs. mass:
+
+bayes_R2(nsyll_mdl)[, 1] - bayes_R2(nsyll_null_mdl)[, 1]
+```
+
+Plot the posterior distribution of the main model:
+
+```{r nsyll_post_p}
+# Plot basics:
+
+nsyll_post_p <- posterior_samples(nsyll_mdl) %>%
+  ggplot(aes(x = b_cnt_massmass)) +
+  geom_vline(xintercept = 0, linetype = 'dashed') +
+  geom_density(fill = 'steelblue',
+               alpha = 0.8)
+
+# Scales and axes:
+
+nsyll_post_p <- nsyll_post_p +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Probability density') +
+  xlab('Log coefficient')
+
+# Cosmetics:
+
+nsyll_post_p <- nsyll_post_p +
+  theme_classic() +
+  theme(axis.text.x = element_text(size = 12),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 16,
+                                    margin = margin(r = 5)),
+        axis.title.x = element_text(face = 'bold',
+                                    size = 16))
+
+# Show and save:
+
+nsyll_post_p
+ggsave('../figures/nsyll_posterior.pdf', nsyll_post_p,
+       width = 5, height = 3)
+```
+
+Put both together into a double plot:
+
+```{r nsyll_double_p}
+# Fix title re-adjusting in double plot:
+
+nsyll_post_p <- nsyll_post_p +
+  theme(axis.title.x = element_text(margin = margin(t = -40)))
+
+# Use patchwork to make a double plot:
+
+nsyll_double_p <- nsyll_p + plot_spacer() + nsyll_post_p +
+  plot_layout(widths = c(3, 0.5, 4))
+
+# Show and save:
+
+nsyll_double_p
+ggsave('../figures/nsyll_double_plot.pdf',
+       width = 9, height = 4)
+```
+
+Make a plot of the conditional effects for this:
+
+```{r nsyll_conditional_effects_extract}
+# Extract conditional effects:
+
+nsyll_cond <- conditional_effects(nsyll_mdl,
+                                  effects = 'cnt_mass')
+
+# Extract data frame with conditional effects and 95% credible intervals:
+
+nsyll_pred_df <- nsyll_cond$cnt_mass
+```
+
+Make a ggplot out of this:
+
+```{r}
+# Plot basics:
+
+nsyll_cond_p <- nsyll_pred_df %>% 
+  ggplot(aes(x = cnt_mass, y = estimate__)) +
+  geom_point(size = 3, pch = 15) +
+  geom_errorbar(aes(ymin = lower__, ymax = upper__),
+                width = 0.4)
+
+# Axes and labels:
+
+nsyll_cond_p <- nsyll_cond_p +
+  scale_y_continuous(limits = c(0, 1.2), breaks = seq(0, 1.2, 0.2),
+                     expand = c(0, 0)) +
+  ylab('Posterior syllable count') +
+  xlab(NULL)
+
+# Cosmetics:
+
+nsyll_cond_p <- nsyll_cond_p +
+  theme_classic() +
+  theme(axis.text.x = element_text(size = 12),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 12))
+
+# Show and save:
+
+nsyll_cond_p
+ggsave('../figures/nsyll_conditional_effects.pdf',
+       width = 2, height = 3.5)
+```
+
+
+## Length analyses: phonemes
+
+Does word length depend on etymology? For monosyllabic only:
+
+```{r monosyll_nphon_avgs_etym}
+mono %>% 
+  filter(NSyll == 1) %>% 
+  group_by(major_etym) %>% 
+  summarize(NPhon_M = mean(NPhon, na.rm = TRUE),
+            NPhon_SD = sd(NPhon, na.rm = TRUE)) %>% 
+  arrange(NPhon_M)
+```
+
+Make a model of syllable length as a function of etymology, controlling for frequency:
+
+```{r nphon_etym_mdl}
+nphon_etym_mdl <- brm(NPhon_0 ~ 1 + major_etym + logfreq + NSyll,
+                      data = mono,
+                  
+                      # Likelihood function:
+                      family = negbinomial,
+                  
+                      # Priors:
+                      prior = priors,
+                
+                      # MCMC settings:
+                      init = 0, seed = 666,
+                      cores = 4, chains = 4,
+                      warmup = 2000, iter = 4000)
+
+# Save:
+
+save(nphon_etym_mdl,
+     file = '../models/nphon_by_etymology_mdl.RData')
+```
+
+Show the model:
+
+```{r check_nphon_etym_mdl}
+nphon_etym_mdl
+
+bayes_R2(nphon_etym_mdl)
+```
+
+Get the comparison null model for LOO comparisons:
+
+```{r nphon_etym_mdl_null}
+nphon_etym_mdl_null <- brm(NPhon_0 ~ 1 + NSyll + logfreq,
+                           data = mono,
+                  
+                           # Likelihood function:
+                           family = negbinomial,
+                  
+                           # Priors:
+                           prior = priors,
+                
+                           # MCMC settings:
+                           init = 0, seed = 666,
+                           cores = 4, chains = 4,
+                           warmup = 2000, iter = 4000)
+
+# Save:
+
+save(nphon_etym_mdl_null,
+     file = '../models/nphoneme_by_etymology_mdl_null.RData')
+```
+
+Do LOO-CV for both:
+
+```{r nphon_etym_loo}
+nphon_etym_loo <- loo(nphon_etym_mdl)
+nphon_etym_null_loo <- loo(nphon_etym_mdl_null)
+
+# LOO compare:
+
+nphon_etym_loo_compare <- loo_compare(nphon_etym_loo,
+                                      nphon_etym_null_loo)
+
+# Show:
+
+nphon_etym_loo_compare
+```
+
+This motivates the inclusion of etymology into the main model.
+
+Look at syllable number by count/mass. First, averages - for display purposes for monosyllabic ones only:
+
+```{r monosyll_nphon_avgs}
+mono %>% 
+  filter(NSyll == 1) %>% 
+  group_by(cnt_mass) %>% 
+  summarize(NPhon_M = mean(NPhon, na.rm = TRUE),
+            NPhon_SD = sd(NPhon, na.rm = TRUE))
+```
+
+Make a plot of the syllable count by mass/count. For this, we'll calculate the proportion of count/mass for each number of syllables:
+
+```{r nphon_counts}
+nphon_counts <- mono %>% 
+  filter(NSyll == 1) %>% 
+  filter(!is.na(NPhon)) %>% 
+  count(NPhon, cnt_mass) %>% 
+  group_by(NPhon) %>% 
+  mutate(prop = n/ sum(n))
+
+# Show table:
+
+nphon_counts
+```
+
+Append the N next to that:
+
+```{r N_for_nphon_counts}
+N_nphon <- mono %>% 
+  filter(NSyll == 1) %>% 
+  count(NPhon) %>%
+  filter(!is.na(NPhon)) %>% 
+  rename(N = n)
+
+# Merge:
+
+nphon_counts <- left_join(nphon_counts, N_nphon)
+
+# Create the labels for the x-axis:
+
+nphon_counts <- mutate(nphon_counts,
+                       NPhon = str_c(NPhon, ' phonemes\nN = ',
+                                     N))
+
+# Change only the first two, since it needs singular:
+
+nphon_counts[1, ]$NPhon <- '1 phoneme\nN = 6'
+
+# Check:
+
+nphon_counts
+```
+
+Make the plot:
+
+```{r nphon_p}
+# Plot basics:
+
+nphon_p <- nphon_counts %>% 
+  ggplot(aes(x = factor(NPhon),
+             y = prop, fill = cnt_mass)) +
+  geom_col()
+
+# Axes and labels:
+
+nphon_p <- nphon_p +
+  ylab('Proportion') +
+  xlab(NULL) +
+  scale_fill_brewer(palette = 'Set1') +
+  scale_y_continuous(expand = c(0, 0))
+
+# Cosmetics:
+
+nphon_p <- nphon_p +
+  theme_classic() +
+  theme(legend.position = 'top',
+        legend.title = element_blank(),
+        axis.text.x = element_text(size = 10,
+                                   angle = 45,
+                                   vjust = 1,
+                                   hjust = 1),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 16,
+                                    margin = margin(r = 5)),
+        axis.title.x = element_text(face = 'bold',
+                                    size = 16))
+
+# Show and save:
+
+nphon_p
+ggsave('../figures/nphon_count_mass.pdf',
+       width = 4, height = 4)
+```
+
+Make the big model with count/mass:
+
+Make a model of syllable length as a function of etymology, controlling for frequency:
+
+```{r nphon_mdl}
+nphon_mdl <- brm(NPhon | rate(NSyll) ~ 1 + cnt_mass + 
+                   major_etym + logfreq,
+                 data = mono,
+                 
+                 # Likelihood function:
+                 family = negbinomial,
+                 
+                 # Priors:
+                 prior = priors,
+                
+                 # MCMC settings:
+                 init = 0, seed = 666,
+                 cores = 4, chains = 4,
+                 warmup = 2000, iter = 4000)
+
+# Save:
+
+save(nphon_mdl,
+     file = '../models/nphon_mdl.RData')
+```
+
+Show the model:
+
+```{r check_nphon_mdl}
+nphon_mdl
+```
+
+Perform a hypothesis test for the influence of count/mass:
+
+```{r nphon_hypothesis}
+hypothesis(nphon_mdl, 'cnt_massmass > 0')
+```
+
+Create a null model without `cnt_mass` for R-squared comparison:
+
+```{r nphon_null_mdl}
+nphon_null_mdl <- brm(NPhon | rate(NSyll) ~ 1 + major_etym + logfreq,
+                      data = mono,
+                 
+                      # Likelihood function:
+                      family = negbinomial,
+                 
+                      # Priors:
+                      prior = priors,
+                
+                      # MCMC settings:
+                      init = 0, seed = 666,
+                      cores = 4, chains = 4,
+                      warmup = 2000, iter = 4000)
+
+# Save:
+
+save(nphon_null_mdl,
+     file = '../models/nphon_null_mdl.RData')
+```
+
+Check the unique contribution of `cnt_mass` on phoneme number:
+
+```{r bayes_r2_nphon_diff}
+# R-squared of full model and model without cnt_mass:
+
+bayes_R2(nphon_mdl)
+bayes_R2(nphon_null_mdl)
+
+# Difference between R2 to get unique contribution of count vs. mass:
+
+bayes_R2(nphon_mdl)[, 1] - bayes_R2(nphon_null_mdl)[, 1]
+```
+
+No effect whatsoever.
+
+Plot the posterior distribution of the number of phoneme effect from `nphon_mdl`:
+
+```{r nphon_post_p}
+# Plot basics:
+
+nphon_post_p <- posterior_samples(nphon_mdl) %>%
+  ggplot(aes(x = b_cnt_massmass)) +
+  geom_vline(xintercept = 0, linetype = 'dashed') +
+  geom_density(fill = 'steelblue',
+               alpha = 0.8)
+
+# Scales and axes:
+
+nphon_post_p <- nphon_post_p +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Probability density') +
+  xlab('Log coefficient')
+
+# Cosmetics:
+
+nphon_post_p <- nphon_post_p +
+  theme_classic() +
+  theme(axis.text.x = element_text(size = 12),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 16,
+                                    margin = margin(r = 5)),
+        axis.title.x = element_text(face = 'bold',
+                                    size = 16))
+
+# Show and save:
+
+nphon_post_p
+ggsave('../figures/nphon_posterior.pdf', nphon_post_p,
+       width = 5, height = 3)
+```
+
+Put both together into a double plot:
+
+```{r nphon_double_p}
+# Fix title re-adjusting in double plot:
+
+nphon_post_p <- nphon_post_p +
+  theme(axis.title.x = element_text(margin = margin(t = -50)))
+
+# Use patchwork to create double plot:
+
+nphon_double_p <- nphon_p + plot_spacer() + nphon_post_p +
+  plot_layout(widths = c(3, 0.5, 4))
+
+# Show and save:
+
+nphon_double_p
+ggsave(plot = nphon_double_p,
+       filename = '../figures/nphon_double_plot.pdf',
+       width = 9, height = 4)
+```
+
+This completes this analysis.

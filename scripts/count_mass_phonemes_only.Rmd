@@ -1,0 +1,672 @@
+---
+title: "Analysis of count/mass systematicity: phonemes"
+author: "Bodo"
+date: "25/02/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+There is some overlap between this script and the length script. I recommend having a detailed look at the length script first, as this contains more detailed descriptions of the data exclusion steps, of which several will be undertaken in one go in this analysis.
+
+Load libraries:
+
+```{r packages, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(brms)
+library(patchwork)
+library(lsr) # for cramer's V
+library(ggpubr) # for balloon plots
+```
+
+Print versions for reproducibility (only those that will be reported in the write-up):
+
+```{r package_versions}
+R.Version()
+packageVersion('tidyverse')
+packageVersion('brms')
+packageVersion('patchwork')
+packageVersion('lsr')
+packageVersion('ggpubr')
+```
+
+Load data:
+
+```{r data_loading, message = FALSE, warning = FALSE}
+BECL <- read_csv('../data/BECL.csv')
+ELP <- read_csv('../data/ELP_red.csv')
+CMU_full <- readLines('../data/CMU_dict-0.7b.txt') # for final phonemes
+CMU <- read_csv('../data/CMU_phoneme_counts.csv') # prepared phoneme counts
+OED <- read_csv('../data/OED_processed_etymologies.csv')
+
+# Phoneme classifications:
+
+phones <- read.table('../data/CMU_dict-0.7b.phones.txt')
+names(phones) <- c('phoneme', 'class')
+```
+
+Get IPA characters for plotting consonsants:
+
+```{r set_phoneme_labels}
+phones$IPA <- NA
+phones[phones$phoneme == 'B', ]$IPA <- 'b'
+phones[phones$phoneme == 'CH', ]$IPA <- 'tʃ'
+phones[phones$phoneme == 'D', ]$IPA <- 'd'
+phones[phones$phoneme == 'DH', ]$IPA <- 'ð'
+phones[phones$phoneme == 'F', ]$IPA <- 'f'
+phones[phones$phoneme == 'G', ]$IPA <- 'g'
+phones[phones$phoneme == 'HH', ]$IPA <- 'h'
+phones[phones$phoneme == 'JH', ]$IPA <- 'dʒ'
+phones[phones$phoneme == 'K', ]$IPA <- 'k'
+phones[phones$phoneme == 'L', ]$IPA <- 'l'
+phones[phones$phoneme == 'M', ]$IPA <- 'm'
+phones[phones$phoneme == 'N', ]$IPA <- 'n'
+phones[phones$phoneme == 'NG', ]$IPA <- 'ŋ'
+phones[phones$phoneme == 'P', ]$IPA <- 'p'
+phones[phones$phoneme == 'R', ]$IPA <- 'r'
+phones[phones$phoneme == 'S', ]$IPA <- 's'
+phones[phones$phoneme == 'SH', ]$IPA <- 'ʃ'
+phones[phones$phoneme == 'T', ]$IPA <- 't'
+phones[phones$phoneme == 'TH', ]$IPA <- 'θ'
+phones[phones$phoneme == 'V', ]$IPA <- 'v'
+phones[phones$phoneme == 'Z', ]$IPA <- 'z'
+phones[phones$phoneme == 'ZH', ]$IPA <- 'ʒ'
+phones[phones$phoneme == 'AE', ]$IPA <- 'æ'
+```
+
+## Data carpentry and overview
+
+Get rid of'elastics' and 'neither':
+
+```{r exclude_elastics}
+BECL <- filter(BECL,
+               major_class %in% c('regular_count',
+                                  'regular_mass'))
+```
+
+Lemmatize this and get "regular_mass" and "regular_count" per words.
+
+```{r lemmatize_BECL}
+BECL_wide <- BECL %>%
+  count(lemma, major_class) %>% 
+  pivot_wider(values_from = n,
+              names_from = major_class, values_fill = 0)
+
+# Which more?
+
+BECL_wide <- mutate(BECL_wide,
+                    cnt_mass = ifelse(regular_count > regular_mass, 'count', NA),
+                    cnt_mass = ifelse(regular_count < regular_mass, 'mass', cnt_mass))
+
+# Exclude equals:
+
+BECL_wide <- filter(BECL_wide, !is.na(cnt_mass))
+```
+
+Create a new column that adds labels 'mass sometimes count' and 'count sometimes mass':
+
+```{r code_dominance}
+BECL_wide <- mutate(BECL_wide,
+                    cnt_detailed = ifelse(cnt_mass == 'mass' & regular_count > 0,
+                                          'mass sometimes count', cnt_mass),
+                    cnt_detailed = ifelse(cnt_mass == 'count' & regular_mass > 0,
+                                          'count sometimes mass', cnt_detailed))
+```
+
+Add ELP morphology data - won't be analyzed here directly, but is needed to work on the monomorphemic subset:
+
+```{r join_ELP_data}
+ELP <- mutate(ELP, Word = str_to_lower(Word))
+BECL_wide <- left_join(BECL_wide, select(ELP, Word, NMorph),
+                       by = c('lemma' = 'Word'))
+```
+
+Add CMU and OED data:
+
+```{r join_CMU_and_OED}
+# CMU:
+
+BECL_wide <- left_join(BECL_wide, CMU, by = c('lemma' = 'Word'))
+
+# OED:
+
+BECL_wide <- left_join(BECL_wide, OED,
+                       by = c('lemma' = 'word'))
+```
+
+## Extract subsets
+
+Exclusions:
+
+```{r filter_no_CMU}
+# No match with CMU:
+
+BECL_wide <- filter(BECL_wide, !is.na(AA))
+
+# No etymological data:
+
+BECL_wide <- filter(BECL_wide, !is.na(major_etym))
+```
+
+A subset of those that are _only_ completely mass or completely count:
+
+```{r pure_BECL}
+BECL_clean <- filter(BECL_wide,
+                     cnt_detailed != 'mass sometimes count',
+                     cnt_detailed != 'count sometimes mass')
+```
+
+Get rid of duplicates:
+
+```{r extract_duplicates}
+BECL_clean <- filter(BECL_clean,
+                     !duplicated(lemma))
+```
+
+Make the CMU counts into a presence/absence variable:
+
+```{r convert_CMU_to_presence_absence}
+vars <- colnames(select(BECL_clean, AA:ZH))
+BECL_clean[, vars] <- apply(BECL_clean[, vars],
+                            2, function(x) ifelse(x >= 1, 1, 0))
+```
+
+Create a subset with only the monomorphemics:
+
+```{r monomorphemic_subset_extraction}
+mono <- filter(BECL_clean, NMorph == 1) %>% 
+  select(-regular_count, -regular_mass, -cnt_detailed, -NMorph)
+```
+
+From now on, all analyses will be performed on monomorphemics only. Phoneme analyses on multimorphemic words are problematic because the morphology will be biased towards certain phonemes. We're interested in what's in the root.
+
+## Process position-specific phoneme information
+
+For this we need to use the raw CMU data in the "CMU_full" data frame:
+
+```{r process_phoneme_position}
+## Don't need first 1:126 rows:
+
+CMU_full <- CMU_full[-c(1:126)]
+
+## Process:
+
+CMU_full <- str_split(CMU_full, pattern = ' +')
+
+## Get words:
+
+words <- sapply(CMU_full, FUN = function(x) x[1])
+
+## Get last phonemes:
+
+final <- sapply(CMU_full, FUN = function(x) x[length(x)])
+
+## Get the first phonemes:
+
+first <- sapply(CMU_full, FUN = function(x) x[2])
+```
+
+Make a table out of this:
+
+```{r table_of_phoneme_positions}
+CMU_full_df <- tibble(word = words, final, first) %>% 
+  mutate(word = str_to_lower(word))
+```
+
+Get rid of that final number for some of the vowels (I think for stress? - need to check):
+
+```{r clean_CMU_transcriptions}
+CMU_full_df <- mutate(CMU_full_df,
+                      first = str_replace(first, '[0-9]', ''),
+                      final = str_replace(final, '[0-9]', ''))
+```
+
+Add final class info:
+
+```{r merge_final_class}
+CMU_full_df$first_class <- phones[match(CMU_full_df$first, phones$phoneme), ]$class
+CMU_full_df$final_class <- phones[match(CMU_full_df$final, phones$phoneme), ]$class
+```
+
+Re-order:
+
+```{r reorder_CMU_cols}
+CMU_full_df <- select(CMU_full_df,
+                      word, first, first_class, final, final_class)
+```
+
+Check:
+
+```{r show_CMU}
+CMU_full_df
+```
+
+Show a few examples:
+
+```{r show_CMU_examples}
+sample_n(CMU_full_df, 50)
+```
+
+## Final phoneme class: contigency tables
+
+Merge the monomorphemics with the detailed info:
+
+```{r extract_mono}
+mono <- left_join(mono, CMU_full_df,
+                  by = c('lemma' = 'word'))
+```
+
+Create a table with first and final class:
+
+```{r create_class_contigency_tabs}
+first_tab <- with(mono, table(cnt_mass, first_class))
+final_tab <- with(mono, table(cnt_mass, final_class))
+```
+
+Make proportions out of this:
+
+```{r contingency_props}
+round(prop.table(first_tab, 1), 2)
+round(prop.table(final_tab, 1), 2)
+```
+
+Compare effect sizes:
+
+```{r effect_size}
+cramersV(first_tab)
+cramersV(final_tab) # medium effect for this degree of freedom (df = 5)
+```
+
+Perform a Chi-square tests just for a quick-and-dirty check (won't be reported in the paper):
+
+```{r chisq_tests}
+chisq.test(first_tab)
+chisq.test(final_tab)
+```
+
+Get the standardized residuals for the phoneme classes:
+
+```{r extract_stdres}
+first_stdres <- chisq.test(first_tab)$stdres
+final_stdres <- chisq.test(final_tab)$stdres
+
+# Show:
+
+round(first_stdres, 1)
+round(final_stdres, 1)
+```
+
+Make a balloon plot of the final class:
+
+```{r stdres_balloon}
+# Make into wide format contingency table:
+
+stdres_tab <- as.data.frame(final_stdres) %>% 
+  pivot_wider(values_from = Freq,
+              names_from = final_class)
+
+# Get rid of ID variable, make into data frame and add row names:
+
+stdres_tab <- stdres_tab[, -1]
+stdres_tab <- as.data.frame(stdres_tab)
+row.names(stdres_tab) <- c('count', 'mass')
+
+# Transpose:
+
+stdres_tab <- t(stdres_tab)
+```
+
+Make the plot out of this:
+
+```{r balloon_p, fig.width = 4, fig.height = 8}
+# Plot basics:
+
+balloon_p <- ggballoonplot(stdres_tab, fill = 'value')
+
+# Scales and axes:
+
+balloon_p <- balloon_p +
+  scale_fill_viridis_c(option = 'C') +
+  theme_minimal() +
+  xlab(NULL) +
+  ylab(NULL) +
+  guides(size = FALSE) +
+  theme(legend.title = element_blank())
+
+# Optional, reverse coodinates, depending on presentation:
+
+balloon_p <- balloon_p + coord_flip()
+
+# Show and save:
+
+balloon_p
+ggsave(plot = balloon_p, filename = '../figures/balloon_plot.pdf',
+       width = 5, height = 3)
+# ggsave(plot = balloon_p, filename = '../figures/balloon_plot.pdf',
+#        width = 3, height = 5)
+```
+
+The liquids seem a bit off... they don't fit the pattern where everything else is more likely to be a continuant for mass nouns. Check them:
+
+```{r check_liquids}
+liquid_tab <- with(filter(mono, final_class == 'liquid'),
+                   table(cnt_mass, final))
+
+# Proportions:
+
+round(prop.table(liquid_tab, 1), 2)
+```
+
+Perform a chi-square test on this:
+
+```{r test_liquid_tab}
+chisq.test(liquid_tab) # test statistic compatible with assumed null hypothesis
+```
+
+Create a continuant vs occlusive variable:
+
+```{r create_continuant_var}
+occlusives <- c('stop', 'affricate')
+
+mono <- mutate(mono,
+               continuant = ifelse(final_class %in% occlusives,
+                                   'occlusive', 'continuant'))
+```
+
+Make a table of this:
+
+```{r continuant_v_occlusives_contingency_tab}
+occl_tab <- with(mono,
+                 table(cnt_mass, continuant))
+
+# Check proportions:
+
+round(prop.table(occl_tab, 1), 2)
+
+# Chi-square test and Cramer's V:
+
+chisq.test(occl_tab)
+round(chisq.test(occl_tab)$stdres, 2)
+cramersV(occl_tab) # small effect
+```
+
+## Individual phonemes, codas only (no open syllables)
+
+Check individual consonants per mass/count distinction:
+
+```{r individual_phonemes_tab}
+cons_tab <- with(filter(mono, final_class != 'vowel'),
+     table(cnt_mass, final))
+
+# Check:
+
+cons_tab
+```
+
+Check standardized residuals:
+
+```{r individual_phonemes_stdres}
+cons_stdres <- chisq.test(cons_tab)$stdres
+round(cons_stdres, 1)
+```
+
+Check how many of the continuants are over-represented:
+
+```{r individual_phonemes_overrepresentation}
+# Extract continuant and occlusive phoneme names:
+
+continuants <- filter(phones,
+                      class %in% c('fricative', 'nasal', 'liquid')) %>% 
+  pull(phoneme)
+
+occlusives <- filter(phones,
+                     class %in% c('stop', 'affricate')) %>% 
+  pull(phoneme)
+
+# Check how many of these continuants are over-represented for 
+
+sum(cons_stdres[2, colnames(cons_stdres) %in% continuants] > 0) # positive residual
+sum(cons_stdres[2, colnames(cons_stdres) %in% continuants] < 0) # negative residual
+
+sum(cons_stdres[2, colnames(cons_stdres) %in% occlusives] > 0) # positive residual
+sum(cons_stdres[2, colnames(cons_stdres) %in% occlusives] < 0) # negative residual
+```
+
+Calculate the corresponding proportions:
+
+```{r overall_over_representation}
+9 / (9 + 3) # 75% of continuant phonemes have positive residuals for mass
+7 / (7 + 1) # 87.5% of occlusive phonemes have negative residuals for mass
+```
+
+Create counts of `cnt_mass` versus `continuant`:
+
+```{r create_continuant_tab}
+continuant_counts <- mono %>% 
+  count(cnt_mass, continuant) %>% 
+  group_by(cnt_mass) %>% 
+  mutate(prop = n/ sum(n))
+```
+
+Make a stacked bar plot of occlusive vis-a-vis count/mass:
+
+```{r occl_bar_p}
+# Plot basics:
+
+cont_p <- continuant_counts %>% 
+  ggplot(aes(x = factor(cnt_mass),
+             y = prop, fill = continuant)) +
+  geom_col()
+
+# Axes and labels:
+
+cont_p <- cont_p +
+  ylab('Proportion') +
+  xlab(NULL) +
+  scale_fill_brewer(palette = 'Set1') +
+  scale_y_continuous(expand = c(0, 0))
+
+# Cosmetics:
+
+cont_p <- cont_p +
+  theme_classic() +
+  theme(legend.position = 'top',
+        legend.title = element_blank(),
+        axis.text.x = element_text(size = 12),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 16,
+                                    margin = margin(r = 5)),
+        axis.title.x = element_text(face = 'bold',
+                                    size = 16),
+        plot.margin = margin(r = 40))
+
+# Show and save:
+
+cont_p
+ggsave(plot = cont_p,
+       filename = '../figures/continuant_stacked_barplot.pdf',
+       width = 3, height = 4)
+```
+
+
+## Bayesian models of the consonant patterns
+
+Make the Continuant and FinalClass variable into factors:
+
+```{r make_continuant_var_fac}
+mono <- mutate(mono,
+               continuant = factor(continuant,
+                                   levels = c('occlusive', 'continuant')))
+```
+
+Set weakly informative / regularizing priors on beta coefficients. These will be used throughout all models below. This is a bit lazy, but they are all either bernoulli or negative binomial models, and SD = 1 is decently conservative for both types of models.
+
+```{r set_priors}
+priors <- c(prior(normal(0, 1), class = b))
+```
+
+Logistic regression of occlusive vs. continuant:
+
+```{r occl_mdl}
+occl_mdl <- brm(continuant ~ 1 + cnt_mass + major_etym,
+                data = mono,
+                
+                # Likelihood function:
+                family = bernoulli,
+               
+                # Priors:
+                prior = priors,
+                
+                # MCMC settings:
+                init = 0, seed = 666,
+                cores = 4, chains = 4,
+                warmup = 2000, iter = 4000)
+
+# Save:
+
+save(occl_mdl,
+     file = '../models/occl_mdl.Rdata')
+```
+
+Make the corresponding null model:
+
+```{r occl_null_mdl}
+occl_null_mdl <- brm(continuant ~ 1 + major_etym,
+                     data = mono,
+                
+                     # Likelihood function:
+                     family = bernoulli,
+                     
+                     # Priors:
+                     prior = priors,
+                
+                     # MCMC settings:
+                     init = 0, seed = 666,
+                     cores = 4, chains = 4,
+                     warmup = 2000, iter = 4000)
+
+# Save:
+
+save(occl_null_mdl,
+     file = '../models/occl_null_mdl.Rdata')
+```
+
+Compare R-squared:
+
+```{r bayes_R2_comparison}
+# Invidiual Bayes R2 for each model:
+
+bayes_R2(occl_mdl)
+bayes_R2(occl_null_mdl)
+
+# Difference between R2 to get unique contribution of count vs. mass:
+
+bayes_R2(occl_mdl)[, 1] - bayes_R2(occl_null_mdl)[, 1]
+```
+
+Check the model:
+
+```{r check_occl_mdl}
+occl_mdl
+```
+
+Get the posterior probability of a mass nouns having more occlusives:
+
+```{r occl_hypothesis}
+hypothesis(occl_mdl, 'cnt_massmass > 0')
+```
+
+Plot the posterior distribution:
+
+```{r occl_post_p}
+# Plot basics:
+
+occl_post_p <- posterior_samples(occl_mdl) %>%
+  ggplot(aes(x = b_cnt_massmass)) +
+  geom_vline(xintercept = 0, linetype = 'dashed') +
+  geom_density(fill = 'steelblue',
+               alpha = 0.8)
+
+# Scales and axes:
+
+occl_post_p <- occl_post_p +
+  scale_y_continuous(expand = c(0, 0)) +
+  ylab('Probability density') +
+  xlab('Logit coefficient')
+
+# Cosmetics:
+
+occl_post_p <- occl_post_p +
+  theme_classic() +
+  theme(axis.text.x = element_text(size = 12),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 16,
+                                    margin = margin(r = 5)),
+        axis.title.x = element_text(face = 'bold',
+                                    size = 16))
+
+# Show and save:
+
+occl_post_p
+ggsave('../figures/occlusives_vs_continuantposterior.pdf', occl_post_p,
+       width = 5, height = 3)
+```
+
+Extract the conditional effects:
+
+```{r occl_conditional_effects_extract}
+# Extract conditional effects:
+
+occl_cond <- conditional_effects(occl_mdl,
+                                 effects = 'cnt_mass')
+
+# Extract data frame with conditional effects and 95% credible intervals:
+
+occl_cond_df <- occl_cond$cnt_mass
+```
+
+Make a ggplot out of this:
+
+```{r occl_conditional_effects}
+# Plot basics:
+
+occl_cond_p <- occl_cond_df %>% 
+  ggplot(aes(x = cnt_mass, y = estimate__)) +
+  geom_point(size = 3, pch = 15) +
+  geom_errorbar(aes(ymin = lower__, ymax = upper__),
+                width = 0.4)
+
+# Axes and labels:
+
+occl_cond_p <- occl_cond_p +
+  scale_y_continuous(limits = c(0, 1.2), breaks = seq(0, 1.2, 0.2),
+                     expand = c(0, 0)) +
+  ylab('Posterior probability of continuant') +
+  xlab(NULL)
+
+# Cosmetics:
+
+occl_cond_p <- occl_cond_p +
+  theme_classic() +
+  theme(axis.text.x = element_text(size = 12),
+        axis.title.y = element_text(face = 'bold',
+                                    size = 12))
+
+# Show and save:
+
+occl_cond_p
+ggsave(plot = occl_cond_p,
+       filename = '../figures/occl_conditional_effects.pdf',
+       width = 2, height = 3.5)
+```
+
+This completes this analysis.
+
+
+
+
+
